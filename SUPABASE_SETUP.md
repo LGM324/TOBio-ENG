@@ -1,33 +1,31 @@
-# Supabase 로그인 · 영농기록 설정 가이드
+# Supabase login and farming-record setup guide
 
-정적 프론트(HTML/JS) + Supabase(Auth + DB + RLS) 구성. 추천/시퀀스(Render 백엔드)와
-완전히 분리되어 있고, 인증·기록은 전부 Supabase가 처리합니다.
+Static frontend (HTML/JS) + Supabase (Auth + DB + RLS). This is completely separate from the recommendation/sequence features (Render backend); all authentication and records are handled by Supabase.
 
 ---
 
-## 0. 접속 키 채우기
+## 0. Fill in the connection keys
 
-`js/supabaseConfig.js` 의 두 상수를 채웁니다.
+Fill in the two constants in `js/supabaseConfig.js`.
 
 ```js
-const SUPABASE_URL = "https://<프로젝트>.supabase.co";
-const SUPABASE_PUBLISHABLE_KEY = "sb_publishable_xxxxxxxx";   // publishable 키 (anon 아님)
+const SUPABASE_URL = "https://<project>.supabase.co";
+const SUPABASE_PUBLISHABLE_KEY = "sb_publishable_xxxxxxxx";   // publishable key (not anon)
 ```
 
-> ⚠️ **secret 키(`sb_secret_...`)는 절대 여기에 넣지 마세요.** 프론트엔드는 publishable
-> 키만 씁니다. secret 키는 아래 Edge Function(서버) 안에서만 사용합니다.
+> ⚠️ **Never put the secret key (`sb_secret_...`) here.** The frontend uses only the publishable key. The secret key is used only inside the Edge Function (server) below.
 
 ---
 
-## 1. RLS 정책 SQL (Supabase → SQL Editor 에서 실행)
+## 1. RLS policy SQL (run in Supabase → SQL Editor)
 
-아래 전문을 그대로 실행하세요. 농민별 기록 분리의 핵심입니다.
+Run the whole script below as is. It is the core of keeping each farmer's records separate.
 
 ```sql
 -- ============================================================
--- 0) admin 판별 함수 (RLS 무한재귀 방지를 위해 SECURITY DEFINER)
---    farmers 정책 안에서 farmers를 다시 select하면 재귀가 나므로,
---    RLS를 우회해 admin 여부만 확인하는 함수를 따로 둔다.
+-- 0) admin check function (SECURITY DEFINER to avoid infinite RLS recursion)
+--    Selecting from farmers inside a farmers policy recurses,
+--    so a separate function bypasses RLS and checks only whether the user is admin.
 -- ============================================================
 create or replace function public.is_admin()
 returns boolean
@@ -43,11 +41,11 @@ as $$
 $$;
 
 -- ============================================================
--- 1) farm_records : 본인 것만 CRUD
+-- 1) farm_records : CRUD on own rows only
 -- ============================================================
 alter table public.farm_records enable row level security;
 
--- insert 시 farmer_id를 안 보내도 자동으로 본인(auth.uid())이 되도록 기본값 설정
+-- default so that farmer_id becomes the current user (auth.uid()) even if not sent on insert
 alter table public.farm_records
   alter column farmer_id set default auth.uid();
 
@@ -68,7 +66,7 @@ create policy "records_delete_own" on public.farm_records
   for delete using (farmer_id = auth.uid());
 
 -- ============================================================
--- 2) farmers : 본인 행 조회, admin은 전체. 생성/수정은 admin.
+-- 2) farmers : read own row, admin reads all. Create/update by admin.
 -- ============================================================
 alter table public.farmers enable row level security;
 
@@ -90,84 +88,72 @@ create policy "farmers_delete_admin" on public.farmers
   for delete using (public.is_admin());
 ```
 
-> 프론트가 실수로 `farmer_id`에 남의 id를 넣어도 `with check (farmer_id = auth.uid())`
-> 때문에 INSERT/UPDATE가 **DB 단에서 거부**됩니다. 그래서 프론트는 farmer_id를 아예
-> 보내지 않습니다(기본값이 auth.uid()).
+> Even if the frontend mistakenly puts someone else's id in `farmer_id`, `with check (farmer_id = auth.uid())` makes the database **reject** the INSERT/UPDATE. So the frontend does not send farmer_id at all (it defaults to auth.uid()).
 
 ---
 
-## 2. 첫 관리자(admin) 계정 만들기
+## 2. Create the first admin account
 
-RLS 때문에 "admin이 있어야 admin 행을 만들 수 있는데 첫 admin이 없다"는 닭-달걀
-문제가 있습니다. 첫 admin은 **대시보드 + SQL Editor**로 직접 만듭니다(서버 권한이라 RLS 우회).
+Because of RLS there is a chicken-and-egg problem: an admin is needed to create an admin row, but there is no first admin. Create the first admin directly with the **dashboard + SQL Editor** (server privileges bypass RLS).
 
 1. Supabase → **Authentication → Users → Add user**
-   - Email: `admin@farm.local`  (아이디가 `admin`이면)
-   - Password: 원하는 비밀번호, **Auto Confirm User** 체크
-   - 생성된 유저의 **User UID**(uuid)를 복사
-2. SQL Editor에서 farmers 프로필 행 삽입(복사한 UID 사용):
+   - Email: `admin@farm.local` (if the username is `admin`)
+   - Password: any password you choose; check **Auto Confirm User**
+   - Copy the created user's **User UID** (uuid)
+2. In the SQL Editor, insert the farmers profile row (using the copied UID):
 
 ```sql
 insert into public.farmers (id, username, name, role)
-values ('붙여넣은-UID', 'admin', '관리자', 'admin');
+values ('pasted-UID', 'admin', '관리자', 'admin');
 ```
 
-이제 `admin` / 비밀번호로 `login.html` 에 로그인하면 대시보드에 **🛠️ 관리자** 버튼이 보이고,
-이후 농민 계정은 화면에서 만들 수 있습니다.
+Now log in at `login.html` with `admin` and the password. The dashboard shows a **🛠️ 관리자 (Admin)** button, and farmer accounts can be created from the screen from then on.
 
 ---
 
-## 3. 농민 계정 생성용 Edge Function 배포
+## 3. Deploy the Edge Function for creating farmer accounts
 
-`admin.html` 의 "계정 만들기"는 Auth 관리자 API가 필요하고, 그건 secret 키로만 가능합니다.
-secret 키를 프론트에 두지 않기 위해 **Edge Function(`create-farmer`)** 이 대신 처리합니다.
+"계정 만들기" (Create account) in `admin.html` needs the Auth admin API, which requires the secret key. To keep the secret key out of the frontend, an **Edge Function (`create-farmer`)** handles it instead.
 
 ```bash
-# Supabase CLI 설치 후
+# after installing the Supabase CLI
 supabase login
-supabase link --project-ref <프로젝트ref>
+supabase link --project-ref <project-ref>
 
-# 함수 배포 (코드: supabase/functions/create-farmer/index.ts)
+# deploy the function (code: supabase/functions/create-farmer/index.ts)
 supabase functions deploy create-farmer
 ```
 
-- `SUPABASE_URL`, `SUPABASE_ANON_KEY`, `SUPABASE_SERVICE_ROLE_KEY` 는 Edge Functions
-  런타임에 **자동 주입**됩니다(따로 설정 불필요). 혹시 secret 관리가 필요하면
-  `supabase secrets set` 으로 넣습니다.
-- 이 함수는 호출자의 JWT로 **admin 여부를 먼저 확인**한 뒤에만 계정을 만듭니다.
+- `SUPABASE_URL`, `SUPABASE_ANON_KEY`, and `SUPABASE_SERVICE_ROLE_KEY` are **injected automatically** into the Edge Functions runtime (no setup needed). If you need to manage secrets, set them with `supabase secrets set`.
+- The function **first checks that the caller is an admin** using the caller's JWT, and only then creates the account.
 
-> **CLI 없이 가도 됨(대체 방법 b)**: Edge Function을 안 쓰면, 관리자가 Supabase
-> 대시보드에서 직접 유저를 추가(2번 절차)하고 SQL로 farmers 행을 넣는 방식으로도
-> 운영할 수 있습니다. 이때 `admin.html`의 "계정 만들기"는 동작하지 않지만, **농민 목록
-> 조회**는 그대로 됩니다. (권장은 Function 배포)
+> **Without the CLI (alternative b)**: if you do not use the Edge Function, an admin can add users directly in the Supabase dashboard (step 2) and insert farmers rows with SQL. In that case "계정 만들기" (Create account) in `admin.html` does not work, but the **farmer list** still does. (Deploying the function is recommended.)
 
 ---
 
-## 4. 테스트 계정 예시
+## 4. Example test accounts
 
-| 구분 | 아이디 | 로그인 이메일(내부) | 비밀번호 | role |
+| Type | Username | Login email (internal) | Password | role |
 |---|---|---|---|---|
-| 관리자 | `admin` | `admin@farm.local` | (직접 지정) | admin |
-| 농민 | `hong123` | `hong123@farm.local` | (직접 지정) | farmer |
+| Admin | `admin` | `admin@farm.local` | (your choice) | admin |
+| Farmer | `hong123` | `hong123@farm.local` | (your choice) | farmer |
 
-- 농민 `hong123` 은 admin이 `admin.html`에서 생성하면 됩니다.
-- 로그인 화면에선 **아이디만** 입력하면 됩니다(@farm.local은 코드가 자동으로 붙임).
-
----
-
-## 5. 농민별 기록 분리 원리
-
-1. 로그인하면 Supabase 세션이 생기고, 모든 DB 요청에 그 사용자의 JWT가 자동으로 실립니다.
-2. DB는 JWT에서 `auth.uid()`(= 그 농민의 uuid)를 꺼냅니다.
-3. `farmers.id` 를 **Auth 유저 id와 동일**하게 맞춰뒀으므로, `farm_records.farmer_id = auth.uid()`
-   RLS가 곧 "본인 농민 행"을 의미합니다.
-4. 그래서 `select * from farm_records` 를 해도 **DB가 본인 것만** 돌려주고, 남의 행은
-   조회/수정/삭제가 원천 차단됩니다. 프론트 코드가 필터를 깜빡해도 안전합니다.
+- Farmer `hong123` can be created by the admin in `admin.html`.
+- On the login screen, enter **only the username** (the code appends @farm.local automatically).
 
 ---
 
-## 6. secret 키 주의 (요약)
+## 5. How records are kept separate per farmer
 
-- 프론트(`js/*.js`, HTML)에는 **publishable 키만**. `sb_secret_...` 절대 금지.
-- secret/service-role 키는 **Edge Function 런타임 안에서만** 사용(자동 주입).
-- service-role 키는 RLS를 무시하므로 노출되면 전체 데이터가 뚫립니다. 깃에 커밋도 금지.
+1. On login, a Supabase session is created and the user's JWT is attached to every DB request automatically.
+2. The DB extracts `auth.uid()` (= that farmer's uuid) from the JWT.
+3. `farmers.id` is set to **the same value as the Auth user id**, so the RLS rule `farm_records.farmer_id = auth.uid()` means "the farmer's own rows".
+4. So even `select * from farm_records` returns **only the user's own rows from the DB**, and reading, updating, or deleting anyone else's rows is blocked at the source. It stays safe even if frontend code forgets a filter.
+
+---
+
+## 6. Secret key cautions (summary)
+
+- The frontend (`js/*.js`, HTML) uses **only the publishable key**. Never `sb_secret_...`.
+- The secret/service-role key is used **only inside the Edge Function runtime** (injected automatically).
+- The service-role key bypasses RLS, so if it leaks, all data is exposed. Never commit it to git either.
